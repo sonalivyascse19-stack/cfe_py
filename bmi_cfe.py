@@ -269,6 +269,13 @@ class BMI_CFE(Bmi):
             "coeff_secondary": self.K_lf,  # Controls lateral flow
             "exponent_secondary": 1.0,  # Controls lateral flow, FIXED to 1 based on the Fred Ogden's document
             "storage_threshold_secondary_m": lateral_flow_threshold_storage_m,
+            # --- MODIFICATION START: Init Safe Defaults for New Features ---
+            "is_aet_rootzone": False,    # Default False to match single-layer behavior
+            "max_rootzone_layer": 0,
+            "smc_profile": [],           # Empty list as placeholder
+            "delta_soil_layer_depth_m": [],
+            "ice_fraction_schaake": 0.0, # Default 0 ice
+            # --- MODIFICATION END ---
         }
         self.soil_reservoir["storage_m"] = self.soil_reservoir["storage_max_m"] * 0.667
         self.volstart += self.soil_reservoir["storage_m"]
@@ -388,7 +395,14 @@ class BMI_CFE(Bmi):
         self.soil_params["wltsmc"] = data_loaded["soil_params"]["wltsmc"]
         self.K_lf = data_loaded["K_lf"]
         self.soil_params["scheme"] = data_loaded["soil_scheme"]
-
+        # --- MODIFICATION START: Add Missing Parameters for Parity with C ---
+        # Defaults provided (1.0 or 0.0) to prevent crash if missing from config
+        self.soil_params["a_inflection_point_parameter"] = data_loaded["soil_params"].get("a_inflection_point_parameter", 1.0)
+        self.soil_params["b_shape_parameter"] = data_loaded["soil_params"].get("b_shape_parameter", 1.0)
+        self.soil_params["x_shape_parameter"] = data_loaded["soil_params"].get("x_shape_parameter", 1.0)
+        self.soil_params["ice_content_threshold"] = data_loaded["soil_params"].get("ice_content_threshold", 0.0)
+        # --- MODIFICATION END ---
+        
         # Groundwater parameters
         self.max_gw_storage = data_loaded["max_gw_storage"]
         self.Cgw = data_loaded["Cgw"]
