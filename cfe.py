@@ -439,320 +439,36 @@ class CFE():
             
             cfe_state.surface_runoff_depth_m = 0.0
             cfe_state.infiltration_depth_m = 0.0
+
+        # --- MODIFICATION START: Added Frozen Soil Logic to match C code ---
+        ice_fraction = cfe_state.soil_reservoir.get('ice_fraction_schaake', 0.0)
+        
+        if ice_fraction > 1.0E-2:
+            factor = 1.0
+            cv_frz = 3 
+            # Using 'D' for soil_depth as per C struct usage
+            field_capacity_m = cfe_state.soil_reservoir['soil_water_content_field_capacity'] * cfe_state.soil_params['D'] 
+            field_capacity = field_capacity_m / cfe_state.soil_params['D']
+            
+            frz_fact = cfe_state.soil_params['smcmax'] / field_capacity * (0.412 / 0.468)
+            # Assuming ice_content_threshold is available in parameters
+            ice_threshold = cfe_state.soil_params.get('ice_content_threshold', 0.0) 
+            frzx = ice_threshold * frz_fact
+            
+            acrt = cv_frz * frzx / ice_fraction
+            sum1 = 1.0
+            
+            for i1 in range(1, cv_frz):
+                k = 1
+                for i2 in range(i1 + 1, cv_frz):
+                    k *= i2
+                sum1 += np.power(acrt, (cv_frz - i1)) / float(k)
+                
+            factor = 1.0 - np.exp(-acrt) * sum1
+            
+            # Apply factor to infiltration
+            cfe_state.infiltration_depth_m = factor * cfe_state.infiltration_depth_m
+            cfe_state.surface_runoff_depth_m = cfe_state.timestep_rainfall_input_m - cfe_state.infiltration_depth_m
+        # --- MODIFICATION END ---
             
         return
-    
-    # __________________________________________________________________________________________________________
-    def Xinanjiang_partitioning_scheme(self,cfe_state): 
-        """
-            This module takes the water_input_depth_m and separates it into surface_runoff_depth_m
-            and infiltration_depth_m by calculating the saturated area and runoff based on a scheme developed
-            for the Xinanjiang model by Jaywardena and Zhou (2000). According to Knoben et al.
-            (2019) "the model uses a variable contributing area to simulate runoff.  [It] uses
-            a double parabolic curve to simulate tension water capacities within the catchment, 
-            instead of the original single parabolic curve" which is also used as the standard 
-            VIC fomulation.  This runoff scheme was selected for implementation into NWM v3.0.
-            REFERENCES:
-            1. Jaywardena, A.W. and M.C. Zhou, 2000. A modified spatial soil moisture storage 
-                capacity distribution curve for the Xinanjiang model. Journal of Hydrology 227: 93-113
-            2. Knoben, W.J.M. et al., 2019. Supplement of Modular Assessment of Rainfall-Runoff Models
-                Toolbox (MARRMoT) v1.2: an open-source, extendable framework providing implementations
-                of 46 conceptual hydrologic models as continuous state-space formulations. Supplement of 
-                Geosci. Model Dev. 12: 2463-2480.
-            -------------------------------------------------------------------------
-            Written by RLM May 2021
-            Adapted by JMFrame September 2021 for new version of CFE
-            Further adapted by QiyueL August 2022 for python version of CFE
-            ------------------------------------------------------------------------
-            Inputs
-            double  time_step_rainfall_input_m           amount of water input to soil surface this time step [m]
-            double  field_capacity_m                     amount of water stored in soil reservoir when at field capacity [m]
-            double  max_soil_moisture_storage_m          total storage of the soil moisture reservoir (porosity*soil thickness) [m]
-            double  column_total_soil_water_m     current storage of the soil moisture reservoir [m]
-            double  a_inflection_point_parameter  a parameter
-            double  b_shape_parameter             b parameter
-            double  x_shape_parameter             x parameter
-                //
-            Outputs
-            double  surface_runoff_depth_m        amount of water partitioned to surface water this time step [m]
-            double  infiltration_depth_m          amount of water partitioned as infiltration (soil water input) this time step [m]
-            ------------------------------------------------------------------------- 
-        """
-
-        # partition the total soil water in the column between free water and tension water
-        free_water_m = cfe_state.soil_reservoir['storage_m']- cfe_state.soil_reservoir['storage_threshold_primary_m'];
-
-        if (0.0 < free_water_m):
-
-            tension_water_m = cfe_state.soil_reservoir['storage_threshold_primary_m'];
-
-        else: 
-
-            free_water_m = 0.0;
-            tension_water_m = cfe_state.soil_reservoir['storage_m']
-        
-        # estimate the maximum free water and tension water available in the soil column
-        max_free_water_m = cfe_state.soil_reservoir['storage_max_m'] - cfe_state.soil_reservoir['storage_threshold_primary_m']
-        max_tension_water_m = cfe_state.soil_reservoir['storage_threshold_primary_m']
-
-        # check that the free_water_m and tension_water_m do not exceed the maximum and if so, change to the max value
-        if(max_free_water_m < free_water_m): 
-            free_water_m = max_free_water_m
-
-        if(max_tension_water_m < tension_water_m): 
-            tension_water_m = max_tension_water_m
-
-        """
-            NOTE: the impervious surface runoff assumptions due to frozen soil used in NWM 3.0 have not been included.
-            We are assuming an impervious area due to frozen soils equal to 0 (see eq. 309 from Knoben et al).
-
-            The total (pervious) runoff is first estimated before partitioning into surface and subsurface components.
-            See Knoben et al eq 310 for total runoff and eqs 313-315 for partitioning between surface and subsurface
-            components.
-
-            Calculate total estimated pervious runoff. 
-            NOTE: If the impervious surface runoff due to frozen soils is added,
-            the pervious_runoff_m equation will need to be adjusted by the fraction of pervious area.
-        """
-        a_Xinanjiang_inflection_point_parameter = 1
-        b_Xinanjiang_shape_parameter = 1
-        x_Xinanjiang_shape_parameter = 1
-
-        if ((tension_water_m/max_tension_water_m) <= (0.5 - a_Xinanjiang_inflection_point_parameter)): 
-            pervious_runoff_m = cfe_state.timestep_rainfall_input_m * \
-                (np.power((0.5 - a_Xinanjiang_inflection_point_parameter),\
-                    (1.0 - b_Xinanjiang_shape_parameter)) * \
-                        np.power((1.0 - (tension_water_m/max_tension_water_m)),\
-                            b_Xinanjiang_shape_parameter))
-
-        else: 
-            pervious_runoff_m = cfe_state.timestep_rainfall_input_m* \
-                (1.0 - np.power((0.5 + a_Xinanjiang_inflection_point_parameter), \
-                    (1.0 - b_Xinanjiang_shape_parameter)) * \
-                        np.power((1.0 - (tension_water_m/max_tension_water_m)),\
-                            (b_Xinanjiang_shape_parameter)))
-    
-        # Separate the surface water from the pervious runoff 
-        ## NOTE: If impervious runoff is added to this subroutine, impervious runoff should be added to
-        ## the surface_runoff_depth_m.
-        
-        cfe_state.surface_runoff_depth_m = pervious_runoff_m * \
-             (1.0 - np.power((1.0 - (free_water_m/max_free_water_m)),x_Xinanjiang_shape_parameter))
-
-        # The surface runoff depth is bounded by a minimum of 0 and a maximum of the water input depth.
-        # Check that the estimated surface runoff is not less than 0.0 and if so, change the value to 0.0.
-        if(cfe_state.surface_runoff_depth_m < 0.0): 
-            cfe_state.surface_runoff_depth_m = 0.0;
-    
-        # Check that the estimated surface runoff does not exceed the amount of water input to the soil surface.  If it does,
-        # change the surface water runoff value to the water input depth.
-        if(cfe_state.surface_runoff_depth_m > cfe_state.timestep_rainfall_input_m): 
-             cfe_state.surface_runoff_depth_m = cfe_state.timestep_rainfall_input_m
-        
-        # Separate the infiltration from the total water input depth to the soil surface.
-        cfe_state.infiltration_depth_m = cfe_state.timestep_rainfall_input_m- cfe_state.surface_runoff_depth_m;    
-
-        return
-                            
-    # __________________________________________________________________________________________________________
-    def et_from_soil(self,cfe_state):
-        """
-            Take AET from soil moisture storage, 
-            using Budyko type curve to limit PET if wilting<soilmoist<field_capacity
-        """
-        
-        if cfe_state.reduced_potential_et_m_per_timestep > 0:
-            
-            if cfe_state.soil_reservoir['storage_m'] >= cfe_state.soil_reservoir['storage_threshold_primary_m']:
-            
-                cfe_state.actual_et_from_soil_m_per_timestep = np.minimum(cfe_state.reduced_potential_et_m_per_timestep, 
-                                                       cfe_state.soil_reservoir['storage_m'])
-                               
-            elif ((cfe_state.soil_reservoir['storage_m'] > cfe_state.soil_reservoir['wilting_point_m']) and 
-                  (cfe_state.soil_reservoir['storage_m'] < cfe_state.soil_reservoir['storage_threshold_primary_m'])):
-            
-                Budyko_numerator = cfe_state.soil_reservoir['storage_m'] - cfe_state.soil_reservoir['wilting_point_m']
-                Budyko_denominator = cfe_state.soil_reservoir['storage_threshold_primary_m'] - \
-                                     cfe_state.soil_reservoir['wilting_point_m']
-                Budyko = Budyko_numerator / Budyko_denominator
-
-                cfe_state.actual_et_from_soil_m_per_timestep = np.minimum(Budyko * cfe_state.reduced_potential_et_m_per_timestep,cfe_state.soil_reservoir['storage_m'])
-                               
-            cfe_state.soil_reservoir['storage_m'] -= cfe_state.actual_et_from_soil_m_per_timestep
-            cfe_state.reduced_potential_et_m_per_timestep -= cfe_state.actual_et_from_soil_m_per_timestep
-        
-        return
-            
-            
-    # __________________________________________________________________________________________________________
-    def check_is_fabs_less_than_epsilon(self,cfe_state,epsilon=1.0e-9):
-        """ in the instance of calling the gw reservoir the secondary flux should be zero- verify
-            From Line 157 of https://github.com/NOAA-OWP/cfe/blob/master/original_author_code/cfe.c
-        """
-        a = cfe_state.secondary_flux
-        if np.abs(a) < epsilon:
-            cfe_state.is_fabs_less_than_epsilon = True
-        else:
-            print("problem with nonzero flux point 1\n")
-            cfe_state.is_fabs_less_than_epsilon = False 
-    
-    # __________________________________________________________________________________________________________
-    # __________________________________________________________________________________________________________
-    def soil_moisture_flux_ode(self, t, S, cfe_state, reservoir):
-        """
-        Soil reservoir module that solves ODE
-        Using ODE allows simultaneous calculation of outflux, instead of stepwise subtraction of flux which causes overextraction from SM reservoir
-        The behavior of soil moisture storage is divided into 3 stages. 
-        Stage 1: S (Soil moisture storage ) > storage_threshold_primary_m
-            Interpretation: When the soil moisture is plenty, AET(=PET), percolation, and lateral flow are all active.
-            Equation: dS/dt = Infiltration - PET - (Klf+Kperc) * (S - storage_threshold_primary_m)/(storage_max_m - storage_threshold_primary_m)
-        Stage 2: storage_threshold_primary_m > S (Soil moisture storage) > storage_threshold_primary_m - wltsmc
-            Interpretation: When the soil moisture is in the medium range, AET is active and proportional to the soil moisture storage ratio. No percolation and lateral flow fluxes. 
-            Equation: dS/dt = Infiltration - PET * (S - wltsmc)/(storage_threshold_primary_m - wltsmc)
-        Stage 3: wltsmc > S (Soil moisture storage)
-            Interpretation: When the soil moisture is depleted, no outflux is active
-            Equation: dS/dt = Infitlation
-            
-        :param t: time
-        :param S: Soil moisture storage in meter
-        :param storage_threshold_primary_m:
-        :param storage_max_m: maximum soil moisture storage, i.e., porosity
-        :param coeff_primary: K_perc, percolation coefficient
-        :param coeff_secondary: K_lf, lateral flow coefficient
-        :param PET: potential evapotranspiration
-        :param infilt: infiltration
-        :param wilting_point_m: wilting point (in meter)
-        :return: dS
-        """
-        storage_above_threshold_m = S - reservoir['storage_threshold_primary_m']
-        storage_diff = reservoir['storage_max_m'] - reservoir['storage_threshold_primary_m']
-        storage_ratio = np.minimum(storage_above_threshold_m / storage_diff, 1)
-
-        perc_lat_switch = np.multiply(S - reservoir['storage_threshold_primary_m'] > 0, 1)
-        ET_switch = np.multiply(S - reservoir['wilting_point_m'] > 0, 1)
-
-        storage_above_threshold_m_paw = S - reservoir['wilting_point_m']
-        storage_diff_paw = reservoir['storage_threshold_primary_m'] - reservoir['wilting_point_m']
-        storage_ratio_paw = np.minimum(storage_above_threshold_m_paw/storage_diff_paw, 1) # Equation 11 (Ogden's document)
-        dS = cfe_state.infiltration_depth_m -1 * perc_lat_switch * (reservoir['coeff_primary'] + reservoir['coeff_secondary']) * storage_ratio - ET_switch * cfe_state.reduced_potential_et_m_per_timestep * storage_ratio_paw
-        return dS
-
-    # __________________________________________________________________________________________________________
-    # __________________________________________________________________________________________________________
-    def jac(self, t, S, cfe_state, reservoir):
-        # The Jacobian matrix of the equation conceptual_reservoir_flux_calc. Calculated as df/dS = (dS/dt)/dS.
-        storage_diff = reservoir['storage_max_m'] - reservoir['storage_threshold_primary_m']
-    
-        perc_lat_switch = np.multiply(S - reservoir['storage_threshold_primary_m'] > 0, 1)
-        ET_switch = np.multiply((S - reservoir['wilting_point_m'] > 0) and (S - reservoir['storage_threshold_primary_m'] < 0), 1)
-    
-        storage_diff_paw = reservoir['storage_threshold_primary_m'] - reservoir['wilting_point_m']
-    
-        dfdS = -1 * perc_lat_switch * (reservoir['coeff_primary'] + reservoir['coeff_secondary']) * 1/storage_diff - ET_switch * cfe_state.reduced_potential_et_m_per_timestep * 1/storage_diff_paw
-        return [dfdS]
-    
-    # __________________________________________________________________________________________________________
-    # __________________________________________________________________________________________________________
-    def soil_moisture_flux_calc_with_ode(self, cfe_state, reservoir):
-        """
-            This function solves the soil moisture mass balance.
-            Inputs:
-                reservoir
-            Outputs:
-                primary_flux_m (percolation)
-                secondary_flux_m (lateral flow)
-                actual_et_from_soil_m_per_timestep (et_from_soil)
-        """
-
-        # Initialization
-        y0 = [reservoir['storage_m']]
-        t = np.array([0, 0.05, 0.15, 0.3, 0.6, 1.0]) # ODE time descritization of one time step
-
-        # Solve and ODE
-        sol = odeint(
-            self.soil_moisture_flux_ode,
-            y0,
-            t,
-            args=(cfe_state, reservoir),
-            tfirst=True,
-            Dfun=self.jac
-        )
-
-        # Finalize results
-        ts_concat = t
-        ys_concat = np.concatenate(sol, axis=0)
-
-        # Estimate fluxes at each ODE time descritization
-        t_proportion = np.diff(ts_concat)
-        ys_avg = np.convolve(ys_concat, np.ones(2), 'valid') / 2
-
-        lateral_flux = np.zeros(ys_avg.shape)
-        perc_lat_switch = ys_avg - reservoir['storage_threshold_primary_m'] > 0
-        lateral_flux[perc_lat_switch] = reservoir['coeff_secondary'] * np.minimum(
-            (ys_avg[perc_lat_switch] - reservoir['storage_threshold_primary_m']) / (
-                        reservoir['storage_max_m'] - reservoir['storage_threshold_primary_m']), 1)
-        lateral_flux_frac = lateral_flux * t_proportion
-
-        perc_flux = np.zeros(ys_avg.shape)
-        perc_flux[perc_lat_switch] = reservoir['coeff_primary'] * np.minimum(
-            (ys_avg[perc_lat_switch] - reservoir['storage_threshold_primary_m']) / (
-                        reservoir['storage_max_m'] - reservoir['storage_threshold_primary_m']), 1)
-        perc_flux_frac = perc_flux * t_proportion
-
-        et_from_soil = np.zeros(ys_avg.shape)
-        ET_switch = ys_avg - cfe_state.soil_params['wltsmc']* cfe_state.soil_params['D'] > 0
-        et_from_soil[ET_switch] = cfe_state.reduced_potential_et_m_per_timestep * np.minimum(
-            (ys_avg[ET_switch] - cfe_state.soil_params['wltsmc']* cfe_state.soil_params['D']) / (reservoir['storage_threshold_primary_m'] - cfe_state.soil_params['wltsmc']* cfe_state.soil_params['D']), 1)
-        et_from_soil_frac = et_from_soil * t_proportion
-
-        infilt_to_soil = np.repeat(cfe_state.infiltration_depth_m, ys_avg.shape)
-        infilt_to_soil_frac = infilt_to_soil * t_proportion
-
-        # Scale fluxes (Since the sum of all the estimated flux above usually exceed the input flux because of calculation errors, scale it
-        # The more finer ODE time descritization you use, the less errors you get, but the more calculation time it takes 
-        
-        # Get the scale factor
-        sum_outflux = lateral_flux_frac + perc_flux_frac + et_from_soil_frac
-        if sum_outflux.any() == 0:
-            flux_scale = 0
-            if cfe_state.infiltration_depth_m > 0:
-                # To account for mass balance error by ODE
-                final_storage_m = y0[0] + cfe_state.infiltration_depth_m
-            else:
-                final_storage_m = y0[0]
-        else:
-            flux_scale = (
-                (ys_concat[0] - ys_concat[-1]) + np.sum(infilt_to_soil_frac)
-            ) / np.sum(sum_outflux)
-            final_storage_m = ys_concat[-1]
-
-        # Scale the fluxes
-        scaled_lateral_flux = lateral_flux_frac * flux_scale
-        scaled_perc_flux = perc_flux_frac * flux_scale
-        scaled_et_flux = et_from_soil_frac * flux_scale
-
-        # Pass the results
-        cfe_state.primary_flux_m = math.fsum(scaled_perc_flux)
-        cfe_state.secondary_flux_m = math.fsum(scaled_lateral_flux)
-        cfe_state.actual_et_from_soil_m_per_timestep = math.fsum(scaled_et_flux)
-        # reservoir['storage_m'] = ys_concat[-1]
-        cfe_state.soil_reservoir["storage_m"] = final_storage_m
-        
-        # # For debugging
-        # print(f"cfe_state.infiltration_depth_m {cfe_state.infiltration_depth_m}")
-        # print(f"cfe_state.primary_flux_m {cfe_state.primary_flux_m}")
-        # print(f"cfe_state.secondary_flux_m {cfe_state.secondary_flux_m}")
-        # print(f"cfe_state.actual_et_from_soil_m_per_timestep {cfe_state.actual_et_from_soil_m_per_timestep}")
-        # print(f"cfe_state.soil_reservoir['storage_m'] {cfe_state.soil_reservoir['storage_m']}")
-        
-        return
-
-        
-    #    # Comment out because this section raises Runtime error, as dS_soil_reservoir is extremely small
-    #    # dS based on Soil reservoir
-    #    dS_soil_reservoir = ys_concat[-1]-ys_concat[0]
-    #    # dS based on fluxes
-    #    dS_fluxes = cfe_state.infiltration_depth_m - cfe_state.primary_flux_m - cfe_state.secondary_flux_m - cfe_state.actual_et_from_soil_m_per_timestep
-    #    if ((dS_soil_reservoir - dS_fluxes) / dS_soil_reservoir) >= 0.01:
-    #        warnings.warn(f'Mass balance error is more than 1%. \n dS({ys_concat[-1]-ys_concat[0]}) = I({cfe_state.infiltration_depth_m}) - Perc({cfe_state.primary_flux_m}) - Lat({cfe_state.secondary_flux_m}) - AET({cfe_state.actual_et_from_soil_m_per_timestep})')
-        
