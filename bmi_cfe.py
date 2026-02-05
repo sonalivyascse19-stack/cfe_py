@@ -401,6 +401,8 @@ class BMI_CFE(Bmi):
         self.soil_params["b_shape_parameter"] = data_loaded["soil_params"].get("b_shape_parameter", 1.0)
         self.soil_params["x_shape_parameter"] = data_loaded["soil_params"].get("x_shape_parameter", 1.0)
         self.soil_params["ice_content_threshold"] = data_loaded["soil_params"].get("ice_content_threshold", 0.0)
+        # FIX: Add urban_decimal_fraction for impervious area runoff (matches C code)
+        self.soil_params["urban_decimal_fraction"] = data_loaded["soil_params"].get("urban_decimal_fraction", 0.0)
         # --- MODIFICATION END ---
         
         # Groundwater parameters
@@ -431,6 +433,22 @@ class BMI_CFE(Bmi):
             self.soil_scheme = data_loaded["soil_scheme"]
         else:
             self.soil_scheme = "classic"
+        
+        # FIX: Add surface runoff scheme option (matches C code GIUH vs NASH_CASCADE)
+        self.surface_runoff_scheme = data_loaded.get("surface_runoff_scheme", "GIUH")
+        
+        # FIX: Add SFT coupling flag (matches C code is_sft_coupled)
+        self.is_sft_coupled = data_loaded.get("is_sft_coupled", False)
+        
+        # FIX: Add Nash cascade surface parameters (for NASH_CASCADE surface routing)
+        if "nash_surface_storage" in data_loaded:
+            self.nash_surface_storage = np.array(data_loaded["nash_surface_storage"])
+            self.num_surface_nash_reservoirs = len(self.nash_surface_storage)
+        else:
+            self.nash_surface_storage = None
+            self.num_surface_nash_reservoirs = 0
+        self.K_nash_surface = data_loaded.get("K_nash_surface", 0.1)
+        self.runon_infiltration_coeff = data_loaded.get("runon_infiltration_coeff", 0.0)
 
         return
 
