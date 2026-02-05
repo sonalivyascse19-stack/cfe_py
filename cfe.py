@@ -440,6 +440,36 @@ class CFE():
             cfe_state.surface_runoff_depth_m = 0.0
             cfe_state.infiltration_depth_m = 0.0
             
+        # FIX: Added Frozen Soil Logic to match C code
+        ice_fraction = cfe_state.soil_reservoir.get('ice_fraction_schaake', 0.0)
+        
+        if ice_fraction > 1.0E-2:
+            factor = 1.0
+            cv_frz = 3 
+            # Using 'D' for soil_depth as per C struct usage
+            field_capacity_m = cfe_state.soil_reservoir['soil_water_content_field_capacity'] * cfe_state.soil_params['D'] 
+            field_capacity = field_capacity_m / cfe_state.soil_params['D']
+            
+            frz_fact = cfe_state.soil_params['smcmax'] / field_capacity * (0.412 / 0.468)
+            # Assuming ice_content_threshold is available in parameters
+            ice_threshold = cfe_state.soil_params.get('ice_content_threshold', 0.0) 
+            frzx = ice_threshold * frz_fact
+            
+            acrt = cv_frz * frzx / ice_fraction
+            sum1 = 1.0
+            
+            for i1 in range(1, cv_frz):
+                k = 1
+                for i2 in range(i1 + 1, cv_frz):
+                    k *= i2
+                sum1 += np.power(acrt, (cv_frz - i1)) / float(k)
+                
+            factor = 1.0 - np.exp(-acrt) * sum1
+            
+            # Apply factor to infiltration
+            cfe_state.infiltration_depth_m = factor * cfe_state.infiltration_depth_m
+            cfe_state.surface_runoff_depth_m = cfe_state.timestep_rainfall_input_m - cfe_state.infiltration_depth_m
+        
         return
     
     # __________________________________________________________________________________________________________
@@ -514,9 +544,10 @@ class CFE():
             NOTE: If the impervious surface runoff due to frozen soils is added,
             the pervious_runoff_m equation will need to be adjusted by the fraction of pervious area.
         """
-        a_Xinanjiang_inflection_point_parameter = 1
-        b_Xinanjiang_shape_parameter = 1
-        x_Xinanjiang_shape_parameter = 1
+        # FIX: Read parameters from state to match C code
+        a_Xinanjiang_inflection_point_parameter = cfe_state.soil_params['a_inflection_point_parameter']
+        b_Xinanjiang_shape_parameter = cfe_state.soil_params['b_shape_parameter']
+        x_Xinanjiang_shape_parameter = cfe_state.soil_params['x_shape_parameter']
 
         if ((tension_water_m/max_tension_water_m) <= (0.5 - a_Xinanjiang_inflection_point_parameter)): 
             pervious_runoff_m = cfe_state.timestep_rainfall_input_m * \
@@ -560,8 +591,40 @@ class CFE():
             Take AET from soil moisture storage, 
             using Budyko type curve to limit PET if wilting<soilmoist<field_capacity
         """
-        
-        if cfe_state.reduced_potential_et_m_per_timestep > 0:
+        # FIX: Added Root Zone AET Logic to match C code
+        if cfe_state.soil_reservoir.get('is_aet_rootzone', False):
+            # Helper vars for readability
+            max_rootzone_layer = cfe_state.soil_reservoir['max_rootzone_layer']
+            layer_storage_m = cfe_state.soil_reservoir['smc_profile'][max_rootzone_layer] * \
+                              cfe_state.soil_reservoir['delta_soil_layer_depth_m'][max_rootzone_layer]
+            wltsmc = cfe_state.soil_params['wltsmc']
+            field_capacity = cfe_state.soil_reservoir['soil_water_content_field_capacity']
+
+            if cfe_state.soil_reservoir['smc_profile'][max_rootzone_layer] <= wltsmc:
+                cfe_state.actual_et_from_soil_m_per_timestep = 0
+            
+            elif cfe_state.soil_reservoir['smc_profile'][max_rootzone_layer] >= field_capacity:
+                cfe_state.actual_et_from_soil_m_per_timestep = np.minimum(cfe_state.reduced_potential_et_m_per_timestep, layer_storage_m)
+            
+            else:
+                Budyko_numerator = cfe_state.soil_reservoir['smc_profile'][max_rootzone_layer] - wltsmc
+                Budyko_denominator = field_capacity - wltsmc
+                Budyko = Budyko_numerator / Budyko_denominator
+                
+                cfe_state.actual_et_from_soil_m_per_timestep = np.minimum(Budyko * cfe_state.reduced_potential_et_m_per_timestep, layer_storage_m)
+
+            # Update state
+            cfe_state.reduced_potential_et_m_per_timestep -= cfe_state.actual_et_from_soil_m_per_timestep
+            
+            # Remove moisture from specific layer
+            layer_depth = cfe_state.soil_reservoir['delta_soil_layer_depth_m'][max_rootzone_layer]
+            cfe_state.soil_reservoir['smc_profile'][max_rootzone_layer] -= (cfe_state.actual_et_from_soil_m_per_timestep / layer_depth)
+            
+            # Update total storage
+            cfe_state.soil_reservoir['storage_m'] -= cfe_state.actual_et_from_soil_m_per_timestep
+
+        # Original "Bucket" Logic (now inside elif)
+        elif cfe_state.reduced_potential_et_m_per_timestep > 0:
             
             if cfe_state.soil_reservoir['storage_m'] >= cfe_state.soil_reservoir['storage_threshold_primary_m']:
             
@@ -589,7 +652,7 @@ class CFE():
         """ in the instance of calling the gw reservoir the secondary flux should be zero- verify
             From Line 157 of https://github.com/NOAA-OWP/cfe/blob/master/original_author_code/cfe.c
         """
-        a = cfe_state.secondary_flux
+        a = cfe_state.secondary_flux_m
         if np.abs(a) < epsilon:
             cfe_state.is_fabs_less_than_epsilon = True
         else:
@@ -755,4 +818,3 @@ class CFE():
     #    dS_fluxes = cfe_state.infiltration_depth_m - cfe_state.primary_flux_m - cfe_state.secondary_flux_m - cfe_state.actual_et_from_soil_m_per_timestep
     #    if ((dS_soil_reservoir - dS_fluxes) / dS_soil_reservoir) >= 0.01:
     #        warnings.warn(f'Mass balance error is more than 1%. \n dS({ys_concat[-1]-ys_concat[0]}) = I({cfe_state.infiltration_depth_m}) - Perc({cfe_state.primary_flux_m}) - Lat({cfe_state.secondary_flux_m}) - AET({cfe_state.actual_et_from_soil_m_per_timestep})')
-        
