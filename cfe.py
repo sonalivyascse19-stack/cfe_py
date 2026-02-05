@@ -549,11 +549,13 @@ class CFE():
         b_Xinanjiang_shape_parameter = cfe_state.soil_params['b_shape_parameter']
         x_Xinanjiang_shape_parameter = cfe_state.soil_params['x_shape_parameter']
 
+        # FIX: Per Jayawardena & Zhou (2000) Eq. 2a, when W/Wmax <= (0.5 - a):
+        # f/F = (0.5-a)^(1-b) * (W/Wmax)^b  [NOT (1 - W/Wmax)^b]
         if ((tension_water_m/max_tension_water_m) <= (0.5 - a_Xinanjiang_inflection_point_parameter)): 
             pervious_runoff_m = cfe_state.timestep_rainfall_input_m * \
                 (np.power((0.5 - a_Xinanjiang_inflection_point_parameter),\
                     (1.0 - b_Xinanjiang_shape_parameter)) * \
-                        np.power((1.0 - (tension_water_m/max_tension_water_m)),\
+                        np.power((tension_water_m/max_tension_water_m),\
                             b_Xinanjiang_shape_parameter))
 
         else: 
