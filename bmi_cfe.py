@@ -545,7 +545,19 @@ class BMI_CFE(Bmi):
     # ________________________________________________________
     def load_unit_test_data(self):
         self.unit_test_data = pd.read_csv(self.compare_results_file)
-        self.cfe_output_data = pd.DataFrame().reindex_like(self.unit_test_data)
+        # Create output DataFrame with correct dtypes to avoid LossySetitemError
+        # on newer pandas (≥2.x) / Python 3.14+
+        self.cfe_output_data = pd.DataFrame(
+            index=self.unit_test_data.index,
+            columns=self.unit_test_data.columns,
+        )
+        # "Time" column will hold datetime strings, so ensure it's object dtype;
+        # all other columns are numeric and default to float64 via NaN fill.
+        for col in self.cfe_output_data.columns:
+            if col == "Time":
+                self.cfe_output_data[col] = pd.Series(dtype="object")
+            else:
+                self.cfe_output_data[col] = pd.Series(dtype="float64")
 
     # ________________________________________________________
     def run_unit_test(
