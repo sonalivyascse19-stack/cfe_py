@@ -32,7 +32,42 @@ class CFE():
         
         cfe_state.actual_et_m_per_timestep += cfe_state.actual_et_from_rain_m_per_timestep
         
+    
     # ____________________________________________________________________________________
+    # FIX: Added ET from retention depth to match C code (cfe.c lines 604-624)
+    def calculate_evaporation_from_retention_depth(self, cfe_state):
+        """
+        Take ET from surface retention depth (Nash surface storage[0]) before taking from soil.
+        This matches the C implementation et_from_retention_depth().
+        """
+        cfe_state.actual_et_from_retention_depth_m_per_timestep = 0.0
+        
+        # Only applies when using Nash cascade for surface routing
+        if not hasattr(cfe_state, 'nash_surface_storage') or cfe_state.nash_surface_storage is None:
+            return
+        if len(cfe_state.nash_surface_storage) == 0 or cfe_state.nash_surface_storage[0] <= 0.0:
+            return
+        if cfe_state.reduced_potential_et_m_per_timestep <= 0.0:
+            return
+        
+        if cfe_state.reduced_potential_et_m_per_timestep >= cfe_state.nash_surface_storage[0]:
+            cfe_state.actual_et_from_retention_depth_m_per_timestep = cfe_state.nash_surface_storage[0]
+            cfe_state.nash_surface_storage[0] = 0.0
+        else:
+            cfe_state.actual_et_from_retention_depth_m_per_timestep = cfe_state.reduced_potential_et_m_per_timestep
+            cfe_state.nash_surface_storage[0] -= cfe_state.actual_et_from_retention_depth_m_per_timestep
+        
+        cfe_state.reduced_potential_et_m_per_timestep -= cfe_state.actual_et_from_retention_depth_m_per_timestep
+        
+        # Track volumes
+        cfe_state.vol_et_from_retention_depth = getattr(cfe_state, 'vol_et_from_retention_depth', 0.0)
+        cfe_state.vol_et_from_retention_depth += cfe_state.actual_et_from_retention_depth_m_per_timestep
+        cfe_state.vol_et_to_atm += cfe_state.actual_et_from_retention_depth_m_per_timestep
+        cfe_state.volout += cfe_state.actual_et_from_retention_depth_m_per_timestep
+        cfe_state.actual_et_m_per_timestep += cfe_state.actual_et_from_retention_depth_m_per_timestep
+        
+    # ____________________________________________________________________________________
+# ____________________________________________________________________________________
     def calculate_evaporation_from_soil(self, cfe_state):
         """
         If the soil moisture calculation scheme is 'classic', calculate the evaporation from the soil
@@ -208,6 +243,8 @@ class CFE():
         # Rainfall and ET 
         self.calculate_input_rainfall_and_PET(cfe_state)
         self.calculate_evaporation_from_rainfall(cfe_state)
+        # FIX: Add ET from retention depth (matches C code order)
+        self.calculate_evaporation_from_retention_depth(cfe_state)
         self.calculate_evaporation_from_soil(cfe_state)
         
         # Infiltration partitioning
@@ -229,12 +266,16 @@ class CFE():
         self.check_is_fabs_less_than_epsilon(cfe_state) 
         self.remove_flux_from_deep_gw_to_chan_m(cfe_state)
         
-        # Surface runoff rounting
-        self.convolution_integral(cfe_state)
+        # FIX: Surface runoff routing - support both GIUH and Nash cascade (matches C)
+        surface_runoff_scheme = getattr(cfe_state, 'surface_runoff_scheme', 'GIUH')
+        if surface_runoff_scheme.upper() == 'NASH_CASCADE':
+            self.nash_cascade_surface(cfe_state)
+        else:  # Default to GIUH
+            self.convolution_integral(cfe_state)
         self.track_volume_from_giuh(cfe_state)
         self.track_volume_from_deep_gw_to_chan(cfe_state)
         
-        # Lateral flow rounting
+        # Lateral flow routing
         self.nash_cascade(cfe_state)
         self.track_volume_from_nash_cascade(cfe_state)
         self.add_up_total_flux_discharge(cfe_state)
@@ -248,6 +289,51 @@ class CFE():
     # __________________________________________________________________________________________________________
     # __________________________________________________________________________________________________________
     
+    # __________________________________________________________________________________________________________
+    # FIX: Added Nash cascade for surface routing to match C code (cfe.c lines 262-273)
+    def nash_cascade_surface(self, cfe_state):
+        """
+        Nash cascade for surface runoff routing (alternative to GIUH).
+        Also calculates runon infiltration which goes back into soil.
+        Matches C implementation nash_cascade_surface().
+        """
+        # Initialize surface storage if not present
+        if not hasattr(cfe_state, 'nash_surface_storage') or cfe_state.nash_surface_storage is None:
+            num_surface_nash = getattr(cfe_state, 'num_surface_nash_reservoirs', 3)
+            cfe_state.nash_surface_storage = np.zeros(num_surface_nash)
+        
+        num_reservoirs = len(cfe_state.nash_surface_storage)
+        K_surface = getattr(cfe_state, 'K_nash_surface', 0.1)
+        
+        Q = np.zeros(num_reservoirs)
+        
+        for i in range(num_reservoirs):
+            Q[i] = K_surface * cfe_state.nash_surface_storage[i]
+            cfe_state.nash_surface_storage[i] -= Q[i]
+            
+            if i == 0:
+                cfe_state.nash_surface_storage[i] += cfe_state.surface_runoff_depth_m
+            else:
+                cfe_state.nash_surface_storage[i] += Q[i-1]
+        
+        cfe_state.flux_giuh_runoff_m = Q[num_reservoirs - 1]
+        
+        # FIX: Runon infiltration - water from surface storage that re-infiltrates
+        # Only calculate if there's a soil deficit
+        runon_infiltration = 0.0
+        runon_coefficient = getattr(cfe_state, 'runon_infiltration_coeff', 0.0)
+        if runon_coefficient > 0 and cfe_state.soil_reservoir_storage_deficit_m > 0:
+            available_for_runon = cfe_state.nash_surface_storage[0] * runon_coefficient
+            runon_infiltration = min(available_for_runon, cfe_state.soil_reservoir_storage_deficit_m)
+            cfe_state.nash_surface_storage[0] -= runon_infiltration
+            cfe_state.soil_reservoir['storage_m'] += runon_infiltration
+            cfe_state.soil_reservoir_storage_deficit_m -= runon_infiltration
+        
+        cfe_state.runon_infiltration = runon_infiltration
+        cfe_state.vol_runon_infilt = getattr(cfe_state, 'vol_runon_infilt', 0.0) + runon_infiltration
+        
+        return
+
     # __________________________________________________________________________________________________________
     def nash_cascade(self,cfe_state):
         """
@@ -440,6 +526,36 @@ class CFE():
             cfe_state.surface_runoff_depth_m = 0.0
             cfe_state.infiltration_depth_m = 0.0
             
+        # FIX: Added Frozen Soil Logic to match C code
+        ice_fraction = cfe_state.soil_reservoir.get('ice_fraction_schaake', 0.0)
+        
+        if ice_fraction > 1.0E-2:
+            factor = 1.0
+            cv_frz = 3 
+            # Using 'D' for soil_depth as per C struct usage
+            field_capacity_m = cfe_state.soil_reservoir['soil_water_content_field_capacity'] * cfe_state.soil_params['D'] 
+            field_capacity = field_capacity_m / cfe_state.soil_params['D']
+            
+            frz_fact = cfe_state.soil_params['smcmax'] / field_capacity * (0.412 / 0.468)
+            # Assuming ice_content_threshold is available in parameters
+            ice_threshold = cfe_state.soil_params.get('ice_content_threshold', 0.0) 
+            frzx = ice_threshold * frz_fact
+            
+            acrt = cv_frz * frzx / ice_fraction
+            sum1 = 1.0
+            
+            for i1 in range(1, cv_frz):
+                k = 1
+                for i2 in range(i1 + 1, cv_frz):
+                    k *= i2
+                sum1 += np.power(acrt, (cv_frz - i1)) / float(k)
+                
+            factor = 1.0 - np.exp(-acrt) * sum1
+            
+            # Apply factor to infiltration
+            cfe_state.infiltration_depth_m = factor * cfe_state.infiltration_depth_m
+            cfe_state.surface_runoff_depth_m = cfe_state.timestep_rainfall_input_m - cfe_state.infiltration_depth_m
+        
         return
     
     # __________________________________________________________________________________________________________
@@ -514,19 +630,29 @@ class CFE():
             NOTE: If the impervious surface runoff due to frozen soils is added,
             the pervious_runoff_m equation will need to be adjusted by the fraction of pervious area.
         """
-        a_Xinanjiang_inflection_point_parameter = 1
-        b_Xinanjiang_shape_parameter = 1
-        x_Xinanjiang_shape_parameter = 1
+        # FIX: Read parameters from state to match C code
+        a_Xinanjiang_inflection_point_parameter = cfe_state.soil_params['a_inflection_point_parameter']
+        b_Xinanjiang_shape_parameter = cfe_state.soil_params['b_shape_parameter']
+        x_Xinanjiang_shape_parameter = cfe_state.soil_params['x_shape_parameter']
 
+        # FIX: Add impervious area runoff (matches C code cfe.c lines 513-531)
+        urban_fraction = cfe_state.soil_params.get('urban_decimal_fraction', 0.0)
+        ice_fraction = cfe_state.soil_reservoir.get('ice_fraction_xinanjiang', 0.0)
+        impervious_fraction = (urban_fraction * 0.95) + ((1.0 - urban_fraction) * ice_fraction)
+        impervious_runoff_m = impervious_fraction * cfe_state.timestep_rainfall_input_m
+        water_input_pervious_m = cfe_state.timestep_rainfall_input_m - impervious_runoff_m
+
+        # FIX: Per Jayawardena & Zhou (2000) Eq. 2a, when W/Wmax <= (0.5 - a):
+        # f/F = (0.5-a)^(1-b) * (W/Wmax)^b  [NOT (1 - W/Wmax)^b]
         if ((tension_water_m/max_tension_water_m) <= (0.5 - a_Xinanjiang_inflection_point_parameter)): 
-            pervious_runoff_m = cfe_state.timestep_rainfall_input_m * \
+            pervious_runoff_m = water_input_pervious_m * \
                 (np.power((0.5 - a_Xinanjiang_inflection_point_parameter),\
                     (1.0 - b_Xinanjiang_shape_parameter)) * \
-                        np.power((1.0 - (tension_water_m/max_tension_water_m)),\
+                        np.power((tension_water_m/max_tension_water_m),\
                             b_Xinanjiang_shape_parameter))
 
         else: 
-            pervious_runoff_m = cfe_state.timestep_rainfall_input_m* \
+            pervious_runoff_m = water_input_pervious_m* \
                 (1.0 - np.power((0.5 + a_Xinanjiang_inflection_point_parameter), \
                     (1.0 - b_Xinanjiang_shape_parameter)) * \
                         np.power((1.0 - (tension_water_m/max_tension_water_m)),\
@@ -537,7 +663,7 @@ class CFE():
         ## the surface_runoff_depth_m.
         
         cfe_state.surface_runoff_depth_m = pervious_runoff_m * \
-             (1.0 - np.power((1.0 - (free_water_m/max_free_water_m)),x_Xinanjiang_shape_parameter))
+             (1.0 - np.power((1.0 - (free_water_m/max_free_water_m)),x_Xinanjiang_shape_parameter)) + impervious_runoff_m
 
         # The surface runoff depth is bounded by a minimum of 0 and a maximum of the water input depth.
         # Check that the estimated surface runoff is not less than 0.0 and if so, change the value to 0.0.
@@ -560,8 +686,40 @@ class CFE():
             Take AET from soil moisture storage, 
             using Budyko type curve to limit PET if wilting<soilmoist<field_capacity
         """
-        
-        if cfe_state.reduced_potential_et_m_per_timestep > 0:
+        # FIX: Added Root Zone AET Logic to match C code
+        if cfe_state.soil_reservoir.get('is_aet_rootzone', False):
+            # Helper vars for readability
+            max_rootzone_layer = cfe_state.soil_reservoir['max_rootzone_layer']
+            layer_storage_m = cfe_state.soil_reservoir['smc_profile'][max_rootzone_layer] * \
+                              cfe_state.soil_reservoir['delta_soil_layer_depth_m'][max_rootzone_layer]
+            wltsmc = cfe_state.soil_params['wltsmc']
+            field_capacity = cfe_state.soil_reservoir['soil_water_content_field_capacity']
+
+            if cfe_state.soil_reservoir['smc_profile'][max_rootzone_layer] <= wltsmc:
+                cfe_state.actual_et_from_soil_m_per_timestep = 0
+            
+            elif cfe_state.soil_reservoir['smc_profile'][max_rootzone_layer] >= field_capacity:
+                cfe_state.actual_et_from_soil_m_per_timestep = np.minimum(cfe_state.reduced_potential_et_m_per_timestep, layer_storage_m)
+            
+            else:
+                Budyko_numerator = cfe_state.soil_reservoir['smc_profile'][max_rootzone_layer] - wltsmc
+                Budyko_denominator = field_capacity - wltsmc
+                Budyko = Budyko_numerator / Budyko_denominator
+                
+                cfe_state.actual_et_from_soil_m_per_timestep = np.minimum(Budyko * cfe_state.reduced_potential_et_m_per_timestep, layer_storage_m)
+
+            # Update state
+            cfe_state.reduced_potential_et_m_per_timestep -= cfe_state.actual_et_from_soil_m_per_timestep
+            
+            # Remove moisture from specific layer
+            layer_depth = cfe_state.soil_reservoir['delta_soil_layer_depth_m'][max_rootzone_layer]
+            cfe_state.soil_reservoir['smc_profile'][max_rootzone_layer] -= (cfe_state.actual_et_from_soil_m_per_timestep / layer_depth)
+            
+            # Update total storage
+            cfe_state.soil_reservoir['storage_m'] -= cfe_state.actual_et_from_soil_m_per_timestep
+
+        # Original "Bucket" Logic (now inside elif)
+        elif cfe_state.reduced_potential_et_m_per_timestep > 0:
             
             if cfe_state.soil_reservoir['storage_m'] >= cfe_state.soil_reservoir['storage_threshold_primary_m']:
             
@@ -589,7 +747,7 @@ class CFE():
         """ in the instance of calling the gw reservoir the secondary flux should be zero- verify
             From Line 157 of https://github.com/NOAA-OWP/cfe/blob/master/original_author_code/cfe.c
         """
-        a = cfe_state.secondary_flux
+        a = cfe_state.secondary_flux_m
         if np.abs(a) < epsilon:
             cfe_state.is_fabs_less_than_epsilon = True
         else:
@@ -755,4 +913,3 @@ class CFE():
     #    dS_fluxes = cfe_state.infiltration_depth_m - cfe_state.primary_flux_m - cfe_state.secondary_flux_m - cfe_state.actual_et_from_soil_m_per_timestep
     #    if ((dS_soil_reservoir - dS_fluxes) / dS_soil_reservoir) >= 0.01:
     #        warnings.warn(f'Mass balance error is more than 1%. \n dS({ys_concat[-1]-ys_concat[0]}) = I({cfe_state.infiltration_depth_m}) - Perc({cfe_state.primary_flux_m}) - Lat({cfe_state.secondary_flux_m}) - AET({cfe_state.actual_et_from_soil_m_per_timestep})')
-        
